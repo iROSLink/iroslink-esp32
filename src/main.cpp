@@ -43,7 +43,7 @@ static void esc_write_us(int us) { ledcWrite(ESC_PIN, esc_us_to_duty(us)); }
 #define BAT_SCALE    (127.0f / 27.0f)  // V_bat = V_adc × (R1+R2)/R2
 
 // ── Zenoh config ──────────────────────────────────────────────────────────────
-#define MODE             "peer"
+#define MODE             "client"
 #define ROUTER_PORT      7447
 #define ROUTER_CUSTOM_IP "192.168.2.1"  // last-resort if mDNS + gateway both fail
 
@@ -87,6 +87,7 @@ static volatile int64_t  g_last_recv_ms = 0;
 static volatile uint32_t g_recv_count   = 0;  // total messages received (for Hz calc)
 
 static TaskHandle_t g_loop_task = NULL;  // notified by callback to wake loop() immediately
+static volatile bool g_zenoh_connected = true;  // cleared by bat_publish_task on put failure
 
 // ── Motor control ─────────────────────────────────────────────────────────────
 // Use LEDC at 25 kHz (above hearing range) to eliminate PWM whine.
@@ -184,12 +185,18 @@ static void bat_publish_task(void *) {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         float v_bat = analogRead(BAT_PIN) * (3.3f / 4095.0f) * BAT_SCALE;
-        Serial.printf("bat=%.2fV\n", v_bat);
+        // Serial.printf("bat=%.2fV\n", v_bat);
         uint8_t cdr[8] = {0x00, 0x01, 0x00, 0x00};
         memcpy(cdr + 4, &v_bat, 4);
         z_owned_bytes_t payload;
         z_bytes_copy_from_buf(&payload, cdr, sizeof(cdr));
-        z_publisher_put(z_publisher_loan(&bat_pub), z_bytes_move(&payload), NULL);
+        // Known limitation: z_publisher_put returns 1 (batched) on success, not 0.
+        // With Z_FEATURE_BATCHING=1 it never returns <0 even when the router is offline —
+        // the library silently absorbs failed sends during auto-reconnect.
+        // Proper fix requires z_declare_background_transport_events_listener but that
+        // crashes on ESP32 (InstrFetchProhibited), likely needs Z_FEATURE_UNSTABLE_API.
+        g_zenoh_connected = (z_publisher_put(z_publisher_loan(&bat_pub), z_bytes_move(&payload), NULL) < 0)
+                            ? false : g_zenoh_connected;
     }
 }
 
@@ -251,20 +258,35 @@ void setup() {
     // ADC attenuation for 0–3.3 V range (battery divider output)
     analogSetAttenuation(ADC_11db);
 
-    // WiFi — blink LED at 500 ms while connecting
-    Serial.print("Connecting to WiFi...");
+    // WiFi — cycle through WIFI_NETWORKS until one connects, blink LED while trying
+    struct { const char *ssid; const char *pass; } networks[] = { WIFI_NETWORKS };
+    const int NET_COUNT = sizeof(networks) / sizeof(networks[0]);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);  // modem sleep buffers UDP; disable for low-latency
     delay(100);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    delay(100);
-    while (WiFi.status() != WL_CONNECTED) {
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-        delay(500);
+    for (int i = 0; i < NET_COUNT; i++) {
+        Serial.printf("Connecting to WiFi '%s'...", networks[i].ssid);
+        WiFi.begin(networks[i].ssid, networks[i].pass);
+        uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+            digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+            delay(100);
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            digitalWrite(LED_PIN, LOW);
+            Serial.print("OK — IP: ");
+            Serial.println(WiFi.localIP());
+            break;
+        }
+        Serial.println("FAILED");
+        WiFi.disconnect(true);
+        delay(200);
+        if (i == NET_COUNT - 1) {
+            Serial.println("All networks failed — rebooting");
+            delay(100);
+            ESP.restart();
+        }
     }
-    digitalWrite(LED_PIN, LOW);
-    Serial.print("OK — IP: ");
-    Serial.println(WiFi.localIP());
 
     // Router discovery: mDNS → gateway → custom IP
     // MDNS.begin makes the ESP32 itself discoverable; hostByName resolves via lwIP
@@ -292,10 +314,14 @@ void setup() {
         z_config_default(&config);
         zp_config_insert(z_config_loan_mut(&config), Z_CONFIG_MODE_KEY, MODE);
         zp_config_insert(z_config_loan_mut(&config), Z_CONFIG_CONNECT_KEY, g_locator);
+        zp_config_insert(z_config_loan_mut(&config), Z_CONFIG_MULTICAST_SCOUTING_KEY, "false");
 
         Serial.print("Opening Zenoh Session...");
         if (z_open(&s, z_config_move(&config), NULL) < 0) {
+            digitalWrite(LED_PIN,HIGH);
+            delay(100);
             Serial.println("FAILED — retry in 2s");
+            digitalWrite(LED_PIN,LOW);
             delay(2000);
             continue;
         }
@@ -393,36 +419,38 @@ void loop() {
     } else {
         if (now - last_zenoh_ms > 500) {
             drive(0, 0);
-            // fast blink = no comms
-            digitalWrite(LED_PIN, (now % 400) < 200 ? HIGH : LOW);
+            if (!g_zenoh_connected) {
+                // router offline / reconnecting: 100ms on, 2000ms off, not work yet!
+                digitalWrite(LED_PIN, (now % 2100) < 100 ? HIGH : LOW);
+            } else {
+                // slow blink = no comms
+                digitalWrite(LED_PIN, (now % 2000) < 1000 ? HIGH : LOW);
+            }
         }
     }
 
-    // Zenoh session watchdog — if AUTO_RECONNECT stalls, restart cleans up locked mutexes.
-    // Lease=10s × expire_factor=3 → session dead after 30s; 60s gives reconnect time.
-    if (last_zenoh_ms > 0 && (now - last_zenoh_ms) > 60000) {
-        Serial.println("Zenoh silent >60s — rebooting");
+    // Last-resort watchdog: client mode auto-reconnect retries every 1s indefinitely,
+    // so only reboot if it has been stuck for an unreasonably long time (5 min).
+    if (last_zenoh_ms > 0 && (now - last_zenoh_ms) > 300000) {
+        Serial.println("Zenoh silent >5min — rebooting");
         delay(100);
         ESP.restart();
     }
 
-    // Battery voltage — wake publish task every 10 s (task owns zenoh call, can't block loop)
-    if (now - last_bat_ms >= 10000) {
+    // Battery voltage — wake publish task every 2 s (task owns zenoh call, can't block loop)
+    if (now - last_bat_ms >= 2000) {
         last_bat_ms = now;
         if (g_bat_task) xTaskNotifyGive(g_bat_task);
+
+        // WiFi watchdog — if connection dropped, reboot to reconnect cleanly
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi lost — rebooting");
+            drive(0, 0);
+            delay(100);
+            ESP.restart();
+        }
     }
 
     // Block until callback wakes us or safety timeout fires
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
 }
-
-// void loop() {
-//     if (g_cmd_fresh) {
-//         g_cmd_fresh = false;
-//         digitalWrite(LED_PIN, HIGH);
-//     }
-//     // digitalWrite(LED_PIN, HIGH);
-//     delay(10);
-//     digitalWrite(LED_PIN, LOW);
-//     delay(100);
-// }

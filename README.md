@@ -2,6 +2,17 @@
 
 ESP32 firmware that receives ROS 2 drive commands over WiFi (via Zenoh) and controls a differential-drive robot with a suction fan and battery monitoring.
 
+## LED status (GPIO 2)
+
+| Pattern | Meaning |
+|---------|---------|
+| Fast blink 100ms on, 100ms off | Connecting to WiFi |
+| Blink 100ms on, 2000ms off  | Connecting to Router |
+| Single flash on each message | cmd\_vel received and applied |
+| Slow blink 1s on / 1 s off | No cmd\_vel for >500 ms — motors stopped, waiting for comms |
+
+
+
 ## Wiring
 
 | Signal         | ESP32 GPIO |
@@ -17,8 +28,8 @@ ESP32 firmware that receives ROS 2 drive commands over WiFi (via Zenoh) and cont
 ## How it works
 
 ```
-ROS 2 (zenoh router)
-  └─ /cmd_vel ──► rmw_zenoh_cpp ──► Zenoh router ──► WiFi ──► ESP32
+ROS 2 
+  └─ /cmd_vel ──► rmw_zenoh_cpp ──► Zenoh router (or iROSLink) ──► WiFi ──► ESP32
                                                                ├── left / right motors
                                                                ├── suction fan ESC
                                                                └── battery voltage (published back)
@@ -44,12 +55,14 @@ cp include/secret.h.template include/secret.h
 
 Edit `include/secret.h`:
 ```c
-#define WIFI_SSID        "your-network"
-#define WIFI_PASSWORD    "your-password"
-#define ROUTER_MDNS_HOST "your-pc-hostname"  // e.g. "iPhone" → connects to iPhone.local:7447
+#define WIFI_NETWORKS \
+    { "home-network",   "home-password"   }, \
+    { "office-network", "office-password" }
+
+#define ROUTER_MDNS_HOST "your-router-hostname"  // e.g. "iphone" → connects to iphone.local:7447
 ```
 
-The firmware tries to find the Zenoh router by mDNS first, then falls back to the WiFi gateway, then `192.168.2.1`. You can change this in the `src/main.cpp`
+Add as many `WIFI_NETWORKS` entries as needed — the firmware tries each in order (8 s timeout per network, loops until one connects). The Zenoh router is discovered via mDNS first, then falls back to the WiFi gateway, then `192.168.2.1`.
 
 ### 3. Flash
 
@@ -66,57 +79,14 @@ Opening Zenoh Session... OK
 bat=11.82V
 ```
 
-## Running on ROS 2 Jazzy (Linux)
-
-If you previously ran ROS 2 with a different middleware, clear the daemon first:
-```bash
-pkill -9 -f ros && ros2 daemon stop
-```
-
-**Terminal 1** — Zenoh router (bridge between ROS 2 and ESP32):
-```bash
-source /opt/ros/jazzy/setup.bash
-ros2 run rmw_zenoh_cpp rmw_zenohd
-```
-
-**Terminal 2** — keyboard teleoperation:
-```bash
-source /opt/ros/jazzy/setup.bash
-export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-```
-
-### Joystick
-
-Install (one-time):
-```bash
-sudo apt install ros-jazzy-teleop-twist-joy ros-jazzy-joy
-```
-
-**Terminal 3** — gamepad driver:
-```bash
-source /opt/ros/jazzy/setup.bash
-export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-ros2 run joy joy_node
-```
-
-**Terminal 4** — joystick → `/cmd_vel`:
-```bash
-source /opt/ros/jazzy/setup.bash
-export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-ros2 run teleop_twist_joy teleop_node --ros-args \
-    -p axis_linear.x:=1 \      # left stick up/down = forward/back
-    -p axis_angular.yaw:=0 \   # left stick left/right = turn
-    -p scale_angular.yaw:=1.0 \
-    -p enable_button:=4 \      # hold L1/LB as deadman switch
-    -p publish_stamped_twist:=false
-```
-
-> Hold the enable button (L1 / LB) while moving the stick. Releasing it stops the robot.
 
 ## Boot button (GPIO 0)
 
 Press the onboard BOOT button to toggle the fan between 50% throttle and off — useful for testing without a ROS 2 connection.
+
+## Known limitations
+
+- **Router disconnect not detectable mid-session.** If the Zenoh router goes offline after the session is established, the firmware cannot detect this via the zenoh-pico API (`z_publisher_put` always returns 1 with `Z_FEATURE_BATCHING=1` regardless of connection state; `z_declare_background_transport_events_listener` crashes on ESP32). The library will silently auto-reconnect in client mode (within ≤30 s via lease expiry). The LED "reconnecting" blink pattern will **not** activate during this window. The 5-minute silence watchdog (`ESP.restart()`) remains as last resort.
 
 ---
 
